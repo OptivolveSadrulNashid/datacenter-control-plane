@@ -1,0 +1,166 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  OPERATOR
+  VIEWER
+}
+
+enum NodeStatus {
+  CREATED
+  PROVISIONING
+  ACTIVE
+  MAINTENANCE
+  FAILED
+  RETIRED
+}
+
+enum GpuHealth {
+  HEALTHY
+  DEGRADED
+  FAILED
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+enum JobAction {
+  PROVISION_NODE
+  DECOMMISSION_NODE
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique
+  passwordHash String
+  role         Role
+  createdAt    DateTime @default(now())
+
+  @@map("users")
+}
+
+model Cluster {
+  id        String    @id @default(uuid()) @db.Uuid
+  name      String    @unique
+  location  String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  racks Rack[]
+
+  @@index([location])
+  @@index([deletedAt])
+  @@map("clusters")
+}
+
+model Rack {
+  id        String    @id @default(uuid()) @db.Uuid
+  clusterId String    @db.Uuid
+  name      String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  cluster Cluster @relation(fields: [clusterId], references: [id], onDelete: Restrict)
+  nodes   Node[]
+
+  // A rack name only has to be unique inside its own cluster.
+  @@unique([clusterId, name])
+  @@index([clusterId])
+  @@map("racks")
+}
+
+model Node {
+  id        String     @id @default(uuid()) @db.Uuid
+  rackId    String     @db.Uuid
+  hostname  String     @unique
+  cpu       String
+  memoryMb  Int
+  status    NodeStatus @default(CREATED)
+  /// Optimistic-locking token. Every mutation must send the version it read
+  /// and the write only lands if the row is still on that version.
+  version   Int        @default(1)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  deletedAt DateTime?
+
+  rack   Rack             @relation(fields: [rackId], references: [id], onDelete: Restrict)
+  gpus   Gpu[]
+  events LifecycleEvent[]
+  jobs   Job[]
+
+  @@index([rackId])
+  @@index([status])
+  @@index([status, deletedAt])
+  @@map("nodes")
+}
+
+model Gpu {
+  id           String    @id @default(uuid()) @db.Uuid
+  nodeId       String?   @db.Uuid
+  vendor       String
+  model        String
+  memoryMb     Int
+  serialNumber String    @unique
+  healthStatus GpuHealth @default(HEALTHY)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  node Node? @relation(fields: [nodeId], references: [id], onDelete: SetNull)
+
+  @@index([nodeId])
+  @@index([vendor, healthStatus])
+  @@map("gpus")
+}
+
+/// Append-only. Rows are never updated or deleted, so the full status history
+/// of a node survives even after the node itself is soft-deleted.
+model LifecycleEvent {
+  id        String      @id @default(uuid()) @db.Uuid
+  nodeId    String      @db.Uuid
+  eventType String
+  oldStatus NodeStatus?
+  newStatus NodeStatus
+  actor     String
+  reason    String?
+  createdAt DateTime    @default(now())
+
+  node Node @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+
+  @@index([nodeId, createdAt])
+  @@map("lifecycle_events")
+}
+
+model Job {
+  id          String    @id @default(uuid()) @db.Uuid
+  nodeId      String?   @db.Uuid
+  action      JobAction
+  status      JobStatus @default(QUEUED)
+  payload     Json
+  retries     Int       @default(0)
+  error       String?
+  actor       String
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  node Node? @relation(fields: [nodeId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([nodeId])
+  @@map("jobs")
+}

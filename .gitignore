@@ -1,0 +1,8 @@
+node_modules
+dist
+.env
+*.log
+coverage
+web/node_modules
+web/dist
+.claude

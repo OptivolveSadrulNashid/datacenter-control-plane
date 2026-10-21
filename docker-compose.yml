@@ -1,0 +1,109 @@
+name: infrastructure-control-plane
+
+x-app-env: &app-env
+  NODE_ENV: production
+  LOG_LEVEL: info
+  DATABASE_URL: postgresql://icp:icp@postgres:5432/icp?schema=public
+  REDIS_URL: redis://redis:6379
+  RABBITMQ_URL: amqp://icp:icp@rabbitmq:5672
+  JWT_SECRET: dev-only-secret-change-me
+  JWT_EXPIRES_IN: 1h
+  # Overridable so the failure path is demoable without editing this file:
+  #   PROVISION_FAILURE_RATE=1 docker compose up -d worker
+  PROVISION_DELAY_MS: ${PROVISION_DELAY_MS:-3000}
+  PROVISION_FAILURE_RATE: ${PROVISION_FAILURE_RATE:-0}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: icp
+      POSTGRES_PASSWORD: icp
+      POSTGRES_DB: icp
+    ports: ['5432:5432']
+    volumes: ['pgdata:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U icp -d icp']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--appendonly', 'no']
+    ports: ['6379:6379']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: icp
+      RABBITMQ_DEFAULT_PASS: icp
+    # 5672 = AMQP, 15672 = management UI (http://localhost:15672, icp/icp)
+    ports: ['5672:5672', '15672:15672']
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # Runs migrations and seeds, then exits. Both app services wait for it so they
+  # never boot against an empty schema.
+  migrate:
+    build: .
+    environment: *app-env
+    command: sh -c "npx prisma migrate deploy && npm run seed"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    build: .
+    environment: *app-env
+    ports: ['3000:3000']
+    command: node dist/src/server.js
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://localhost:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build: .
+    environment:
+      <<: *app-env
+      SERVICE_NAME: worker
+    command: node dist/src/worker.js
+    # Scale with `docker compose up --scale worker=3`: the job queue distributes
+    # work across replicas and optimistic locking keeps their writes honest.
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+
+  # React SPA served by nginx, which also proxies /api to the API container so
+  # the browser only ever talks to one origin (no CORS setup needed).
+  web:
+    build: ./web
+    ports: ['5173:80']
+    depends_on:
+      api: { condition: service_started }
+
+  adminer:
+    image: adminer:4
+    ports: ['8080:8080']
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      postgres: { condition: service_healthy }
+
+volumes:
+  pgdata:
